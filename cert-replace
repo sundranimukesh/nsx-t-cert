@@ -1,0 +1,132 @@
+procedure to change NSX manager cert
+
+disable server certificate CRL check in NSX manager
+https://kb.vmware.com/s/article/78794
+
+this procedure can be done in any hosts reachable to NSX manager API
+
+check current configuration and revision
+
+export NSX_MGR_VIP="((NSX manager VIP))"
+curl -v -k \
+  "https://${NSX_MGR_VIP}/api/v1/global-configs/SecurityGlobalConfig" \
+  -u admin
+change NSX manager configuration
+curl -v -k -X PUT \
+  "https://${NSX_MGR_VIP}/api/v1/global-configs/SecurityGlobalConfig" \
+  -u admin -H 'Content-Type:application/json' \
+  -d '{"crl_checking_enabled" : false, "resource_type" : "SecurityGlobalConfig", "_revision": ((revision number))}'
+create new NSX manager cert
+https://kb.vmware.com/s/article/2147627
+
+create certificate request (CSR)
+export NSX_MGR_FQDN="((NSX manager FQDN))"
+cat <<EOF > nsx_mgr_csr.cfg
+[ req ]
+distinguished_name = req_distinguished_name
+encrypt_key = no
+prompt = no
+string_mask = nombstr
+x509_extensions = v3_req
+req_extensions = v3_req
+[ v3_req ]
+basicConstraints = CA:false
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier=hash 
+#authorityKeyIdentifier=keyid,issuer
+subjectAltName = DNS:${NSX_MGR_FQDN}, IP:${NSX_MGR_VIP}
+[ req_distinguished_name ]
+countryName = US
+stateOrProvinceName = California
+localityName = CA
+0.organizationName = NSX
+commonName = ${NSX_MGR_VIP}
+EOF
+
+openssl req -new -nodes -out nsx_mgr.csr \
+  -newkey rsa:2048 -keyout nsx_mgr.key \
+  -config nsx_mgr_csr.cfg
+generate certificate
+this procedure should be done in VMCA
+cat nsx_mgr_csr.cfg | tr -d '#' > nsx_mgr_crt.cfg
+openssl x509 -req -days 3650 -in nsx_mgr.csr \
+  -out nsx_mgr.crt \
+  -CA /var/lib/vmware/vmca/root.cer \
+  -CAkey /var/lib/vmware/vmca/privatekey.pem \
+  -extensions v3_req -CAcreateserial \
+  -extfile nsx_mgr_crt.cfg
+cat nsx_mgr.crt /var/lib/vmware/vmca/root.cer >> nsx_mgr_chain.crt
+cp /var/lib/vmware/vmca/root.cer ca.crt
+check generated certificate
+openssl x509 -in nsx_mgr_chain.crt -noout -text
+replace the Certificates on the Platform Services Controller
+this procedure should be done in VMCA
+
+launch Certificate-Manager
+
+/usr/lib/vmware-vmca/bin/certificate-manager
+Select Option 1, then Option 2
+Provide the paths to 3 files as follows:
+nsx_mgr_chain.crt
+nsx_mgr.key
+ca.crt
+import new NSX manager cert to NSX manager
+operate NSX manager GUI
+Log in to the NSX Manager UI using the VIP IP address.
+Navigate to System > Certificates.
+Click Import > Import Certificate. The Import Certificate screen is displayed.
+In the Name field, enter a unique name for the certificate, such as NSX-VIP-CERT.
+In the Certificate Contents field, enter the certificate string. You can locate the certificate string in the nsx_mgr_chain.crt certificate file that you previously generated. Copy and paste the certificate contents of the certificate file into the field.
+In the Private Key field, enter your certificate’s private key. You can locate the key string in the nsx_mgr.key private key file that you previously generated. Copy and paste the key content of the key file into the field.
+Verify that the Service Certificate option is set to No. The Service Certificate setting should be “off” because you are using the certificate with NSX Manager appliance nodes.
+Click Import.
+check Certificate ID
+verify on each individual NSX Manager node
+Log in to each individual NSX Manager node.
+On each node, navigate to the System > Certificates screen.
+Confirm that the certificate has replicated to the NSX-T Manager instance.
+replace existing NSX Manager Certificate with the new certificate
+this procedure can be done in any hosts reachable to NSX manager API
+export NSX_MGR_VIP="((NSX manager VIP))"
+export NSX_MGR_FQDN="((NSX manager FQDN))"
+export CERT_ID="((Certificate ID))"
+curl -v -k -X POST \
+  "https://${NSX_MGR_VIP}/api/v1/cluster/api-certificate?action=set_cluster_certificate&certificate_id=${CERT_ID}" \
+  -u admin -H 'content-type: application/xml'
+After successful api response, wait for 3-4 mins to proceed further
+
+curl -s -k \
+  "https://${NSX_MGR_VIP}/api/v1/cluster/api-certificate" \
+  -u admin -H 'content-type: application/xml'
+import VMCA CA certificate to TKGI control plane
+operate TKGIMC
+login to TKGIMC GUI
+TKGI Configuration > 2. Networking
+check Manage Certificates Manually for NSX
+fill ca.crt in NSX Manager CA Cert
+click GENERATE CONFIGURATION button
+click APPLY CONFIGURATION button
+create test K8s cluster
+check NSX-T objects to be created correctly
+import certificate to VCF trusted store
+SSH to SDDC Manager and change to the root user:
+ssh vcf@((SDDC manager IP address))
+su -
+Copy root CA certificate file (ca.crt) to the /tmp directory on the SDDC Manager VM.
+Run the below command to get commonsvcs truststore password
+cat /etc/vmware/vcf/commonsvcs/trusted_certificates.key
+Use the following command to import root CA to commonsvcs truststore:
+keytool -importcert -alias vmca -file /tmp/ca.crt -keystore /etc/vmware/vcf/commonsvcs/trusted_certificates.store
+When prompted, provide the password to add certificate to truststore obtained in step 3.
+Type yes when prompted to trust the certificate
+Verify if new root CA is added to common services truststore, enter the password for truststore key obtained in step 3.
+keytool -list -v -keystore /etc/vmware/vcf/commonsvcs/trusted_certificates.store
+Use the following command to import root CA to sddc manager truststore:
+keytool -importcert -alias vmca -file /tmp/ca.crt -keystore /etc/alternatives/jre/lib/security/cacerts
+When prompted, provide the password to add certificate to truststore. Default password is "changeit".
+Type yes when prompted to trust the certificate.
+Verify if new root CA is added to SDDC Manager truststore.
+keytool -list -v -keystore /etc/alternatives/jre/lib/security/cacerts
+After importing CA certificate to the truststore, restart all the SDDC Manager Services
+sh /opt/vmware/vcf/operationsmanager/scripts/cli/sddcmanager_restart_services.sh
